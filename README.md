@@ -7,9 +7,9 @@ type of behaviour when loaded program would return the control to the
 Operating System, and continue to execute in memory.  These types of programs
 commonly refer to daemons in Unix/Linux systems and Services in Windows.
 
-Currently only Posix systems are supported (tested on Linux and Darwin).
-Windows support is not yet implemented.
+Currently only POSIX systems are supported (tested to work on Linux, Darwin and
+NetBSD).  Windows support is not yet implemented.
 
-For usage, see [responder](cmd/responder/main.go)
+For usage example, see [cmd/responder](cmd/responder/main.go)
 
 [1]: https://en.wikipedia.org/wiki/Terminate-and-stay-resident_program
