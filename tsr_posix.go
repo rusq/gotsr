@@ -1,4 +1,4 @@
-//go:build posix
+//go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly || solaris || aix
 
 package gotsr
 
@@ -172,7 +172,7 @@ func isRunning(pidFile string) (bool, error) {
 
 // terminate sends a SIGTERM signal to the process with the given PID.
 func terminate(pidFile string) error {
-	pid, err := readPID(p.pidFile)
+	pid, err := readPID(pidFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ErrNotRunning
@@ -181,7 +181,6 @@ func terminate(pidFile string) error {
 	} else if pid == 0 {
 		return ErrNoPID
 	}
-	defer p.Close()
 
 	p, err := os.FindProcess(pid)
 	if err != nil {
