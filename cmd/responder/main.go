@@ -15,6 +15,7 @@ import (
 var (
 	addr    = flag.String("addr", ":6060", "http listener address")
 	stop    = flag.Bool("stop", false, "stop running process")
+	status  = flag.Bool("status", false, "process status")
 	pidFile = flag.String("pid", "", "custom PID file")
 )
 
@@ -28,15 +29,16 @@ func main() {
 	}
 	if *stop {
 		// Terminate running process if -stop flag is set.
-		if err := p.Terminate(); err != nil {
-			if errors.Is(err, gotsr.ErrNotRunning) {
-				log.Printf("process already stopped")
-				return
-			}
+		if err := stopProcess(p); err != nil {
 			log.Fatal(err)
 		}
-		log.Println("process stopped")
-		return
+		return // exit
+	}
+	if *status {
+		if err := printStatus(p); err != nil {
+			log.Fatal(err)
+		}
+		return // exit
 	}
 	// We need to make sure that we're not trying to startup the second time.
 	if isRunning, err := p.IsRunning(); err == nil && isRunning {
@@ -84,6 +86,34 @@ func main() {
 		log.Println("Try 'curl localhost:6060' to see if it's working")
 		log.Printf("To stop the process, run: %s -stop", os.Args[0])
 	}
+}
+
+func stopProcess(p *gotsr.Process) error {
+	if err := p.Terminate(); err != nil {
+		if errors.Is(err, gotsr.ErrNotRunning) {
+			log.Printf("process already stopped")
+			return nil
+		}
+		return err
+	}
+	log.Println("process stopped")
+	return nil
+}
+
+func printStatus(p *gotsr.Process) error {
+	// Check if the process is running.
+	if running, err := p.IsRunning(); err != nil {
+		if errors.Is(err, gotsr.ErrNotRunning) {
+			log.Printf("process is not running")
+			return nil
+		}
+		return err
+	} else if running {
+		log.Println("process is running")
+	} else {
+		log.Println("process is not running")
+	}
+	return nil
 }
 
 // responder is a simple HTTP server that responds with "OK" to all requests.

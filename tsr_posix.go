@@ -1,3 +1,5 @@
+//go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly || solaris || aix
+
 package gotsr
 
 import (
@@ -11,25 +13,9 @@ import (
 	"time"
 )
 
-const (
-	startTimeout = 2 * time.Second
-)
-
 var (
 	errInvalidStage = errors.New("invalid stage")
 	errTimeout      = errors.New("stage 1 process timeout")
-)
-
-// stage is the initialisation stage of the program.
-//
-//go:generate stringer -type stage -linecomment
-type stage int8
-
-const (
-	sUnknown    stage = -1 + iota // UNKNOWN
-	sInitialise                   // INIT
-	sDetach                       // DETACH
-	sRunning                      // RUN
 )
 
 // tsr is the main function that starts the program in the detached mode.
@@ -166,42 +152,39 @@ func notifySuccess(vars envVar) error {
 }
 
 // isRunning checks if the process with the given PID is running.
-func isRunning(pid int) bool {
+func isRunning(pidFile string) (bool, error) {
+	pid, err := readPID(pidFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
 	p, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	if err := p.Signal(syscall.SIGUSR2); err != nil {
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // terminate sends a SIGTERM signal to the process with the given PID.
-func terminate(pid int) error {
+func terminate(pidFile string) error {
+	pid, err := readPID(pidFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ErrNotRunning
+		}
+		return err
+	} else if pid == 0 {
+		return ErrNoPID
+	}
+
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return err
 	}
 	return p.Signal(syscall.SIGTERM)
-}
-
-// envVar is a unique identifier for the environment variables used by TSR.
-type envVar string
-
-// newEnvVar returns a new unique identifier for the environment variables.
-// It is calculated as the first 7 characters of the SHA1 hash of the given
-// string.
-func newEnvVar(s string) envVar {
-	return envVar(hash(s)[0:7])
-}
-
-// stage returns the name of the environment variable that holds the stage.
-func (id envVar) stage() string {
-	return "TSR_" + string(id) + "__STG"
-}
-
-// pid returns the name of the environment variable that holds the PID.
-func (id envVar) pid() string {
-	return "TSR_" + string(id) + "__PID"
 }

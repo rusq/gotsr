@@ -10,9 +10,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	startTimeout = 60 * time.Second
 )
 
 // try on windows: https://superuser.com/questions/198525/how-can-i-execute-a-windows-command-line-in-background
@@ -90,31 +93,12 @@ func (p *Process) AtExit(fn func()) {
 
 // IsRunning returns true if the TSR process is running.
 func (p *Process) IsRunning() (bool, error) {
-	pid, err := readPID(p.pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	} else if pid == 0 {
-		return false, ErrNoPID
-	}
-	return isRunning(pid), nil
+	return isRunning(p.pidFile)
 }
 
 // Terminate instructs the TSR process to terminate if it's running.
 func (p *Process) Terminate() error {
-	pid, err := readPID(p.pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrNotRunning
-		}
-		return err
-	} else if pid == 0 {
-		return ErrNoPID
-	}
-	defer p.Close()
-	return terminate(pid)
+	return terminate(p.pidFile)
 }
 
 // Close removes the PID file.
@@ -123,7 +107,13 @@ func (p *Process) Close() error {
 	return nil
 }
 
-func readPID(filename string) (int, error) {
+// readPID reads the PID from the PID file.
+// PID File format:
+//   PID
+//   data1
+//   ...
+//   dataN
+func readPID(filename string, data ...*string) (int, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return -1, err
@@ -133,11 +123,31 @@ func readPID(filename string) (int, error) {
 	if _, err := fmt.Fscanf(f, "%d", &pid); err != nil {
 		return 0, err
 	}
+
+	// read any additional data stored in the file, if given any
+	for i := range data {
+		if _, err := fmt.Fscanln(f, data[i]); err != nil {
+			return 0, err
+		}
+	}
 	return pid, nil
 }
 
-func writePID(filename string, PID int) error {
-	return os.WriteFile(filename, []byte(strconv.Itoa(PID)+"\n"), 0600)
+func writePID(filename string, PID int, data ...string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "%d\n", PID); err != nil {
+		return err
+	}
+	for _, s := range data {
+		if _, err := fmt.Fprintln(f, s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func hash(s string) string {

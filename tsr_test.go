@@ -12,32 +12,50 @@ func Test_readPID(t *testing.T) {
 	tests := []struct {
 		name     string
 		contents []byte
+		datalen  int
 		want     int
+		wantData []string
 		wantErr  bool
 	}{
 		{
 			"number",
 			[]byte("12345"),
+			0,
 			12345,
+			[]string{},
 			false,
 		},
 		{
 			"number with a new line",
 			[]byte("12345\n"),
+			0,
 			12345,
+			[]string{},
 			false,
 		},
 		{
 			"empty",
 			[]byte(""),
 			0,
+			0,
+			[]string{},
 			true,
 		},
 		{
 			"not a number",
 			[]byte("test"),
 			0,
+			0,
+			[]string{},
 			true,
+		},
+		{
+			"additional data",
+			[]byte("12345\ntest"),
+			1,
+			12345,
+			[]string{"test"},
+			false,
 		},
 	}
 	for _, tt := range tests {
@@ -46,13 +64,24 @@ func Test_readPID(t *testing.T) {
 			if err := os.WriteFile(filename, tt.contents, 0666); err != nil {
 				t.Fatal(err)
 			}
-			got, err := readPID(filename)
+			// initialize the data slice
+			data := make([]*string, tt.datalen)
+			for i := range data {
+				data[i] = new(string)
+			}
+
+			got, err := readPID(filename, data...)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("readPID() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
 				t.Errorf("readPID() = %v, want %v", got, tt.want)
+			}
+			for i, d := range data {
+				if *d != tt.wantData[i] {
+					t.Errorf("readPID() data[%d] = %v, want %v", i, *d, tt.wantData[i])
+				}
 			}
 		})
 	}
@@ -111,11 +140,11 @@ func Test_pidFromExe(t *testing.T) {
 			args{"/usr/local/bin/proggy"},
 			"proggy.pid",
 		},
-		// {
-		// 	"win, with path",
-		// 	args{"C:\\PROGRAM FILES\\SOME PROGRAM\\run.exe"},
-		// 	"run.pid",
-		// },
+		//{
+		//	"win, with path",
+		//	args{"C:\\PROGRAM FILES\\SOME PROGRAM\\run.exe"},
+		//	"run.pid",
+		//},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
