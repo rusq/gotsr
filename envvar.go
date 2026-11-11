@@ -15,7 +15,10 @@ func (id envVar) stage() string {
 	return "TSR_" + string(id) + "__STG"
 }
 
-// pid returns the name of the environment variable that holds the PID.
-func (id envVar) pid() string {
-	return "TSR_" + string(id) + "__PID"
+func (id envVar) addr() string {
+	return "TSR_" + string(id) + "__ADDR"
+}
+
+func (id envVar) secret() string {
+	return "TSR_" + string(id) + "__SECRET"
 }

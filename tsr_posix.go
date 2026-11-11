@@ -8,14 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
 
 var (
 	errInvalidStage = errors.New("invalid stage")
-	errTimeout      = errors.New("stage 1 process timeout")
 )
 
 // tsr is the main function that starts the program in the detached mode.
@@ -60,11 +59,15 @@ func summon(pidFile string, timeout time.Duration, atExit ...func()) (stage, err
 // stageInit is the first stage that starts a new detached instance of the
 // program in a new session.
 func stageInit(pidFile string, vars envVar, image string, timeout time.Duration) error {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGUSR1)
+	ln, err := newStartupChannel(vars)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 
-	os.Setenv(vars.stage(), sDetach.String())
-	os.Setenv(vars.pid(), strconv.Itoa(os.Getpid()))
+	if err := os.Setenv(vars.stage(), sDetach.String()); err != nil {
+		return fmt.Errorf("set detach stage: %w", err)
+	}
 
 	cmd := exec.Command(image, os.Args[1:]...)
 	cmd.Env = os.Environ()
@@ -73,30 +76,29 @@ func stageInit(pidFile string, vars envVar, image string, timeout time.Duration)
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	err := cmd.Start()
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to initialise the process: %s", err)
 	}
-	timer := time.After(timeout)
-	select {
-	case <-sig:
-		pid, err := readPID(pidFile)
-		if err != nil {
-			lg.Printf("process started, but PID file is missing: %s", err)
-		} else if pid == 0 {
-			lg.Println("warning: process started, but PID is 0")
-		} else {
-			lg.Printf("process started with PID: %d", pid)
-		}
-	case <-timer:
-		return errTimeout
+	if err := awaitStartup(ln, vars, timeout); err != nil {
+		return err
+	}
+	pid, err := readPID(pidFile)
+	if err != nil {
+		lg.Printf("process started, but PID file is missing: %s", err)
+	} else if pid == 0 {
+		lg.Println("warning: process started, but PID is 0")
+	} else {
+		lg.Printf("process started with PID: %d", pid)
 	}
 	return nil
 }
 
 // stageDetach starts a new process with the same arguments and environment.
 func stageDetach(vars envVar, image string) error {
-	os.Setenv(vars.stage(), sRunning.String())
+	if err := os.Setenv(vars.stage(), sRunning.String()); err != nil {
+		_ = reportStartup(vars, err)
+		return err
+	}
 
 	cmd := exec.Command(image, os.Args[1:]...)
 
@@ -105,86 +107,58 @@ func stageDetach(vars envVar, image string) error {
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		_ = reportStartup(vars, err)
+		return err
+	}
+	return nil
 }
 
 // stageRun runs the main program.
 func stageRun(pidFile string, vars envVar, atExit []func()) error {
-	pid := os.Getpid()
-	if err := writePID(pidFile, pid); err != nil {
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func() {
+		stopOnce.Do(func() { close(stop) })
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
+	go func() {
+		select {
+		case <-sig:
+			requestStop()
+		case <-stop:
+		}
+	}()
+
+	runtime, err := startControl(pidFile, os.Getpid(), requestStop)
+	if err != nil {
+		signal.Stop(sig)
+		_ = reportStartup(vars, err)
 		return err
 	}
-
-	_ = notifySuccess(vars)
-	// unset the environment variables once the program is running.
-	for _, envVar := range []string{vars.stage(), vars.pid()} {
-		os.Unsetenv(envVar)
-	}
-
-	quit := make(chan os.Signal, 1)
+	registerControlRuntime(runtime)
 	go func() {
-		<-quit
+		<-stop
 		for _, fn := range atExit {
 			fn()
 		}
-		os.Remove(pidFile)
+		signal.Stop(sig)
+		runtime.Close()
 		os.Exit(0)
 	}()
-	signal.Notify(quit, syscall.SIGTERM, os.Interrupt)
-	return nil
-}
 
-// notifySuccess notifies the parent process that the program has started.
-func notifySuccess(vars envVar) error {
-	sPID := os.Getenv(vars.pid())
-	if pid, err := strconv.Atoi(sPID); err != nil {
-		return fmt.Errorf("invalid pid value: %q, error: %w", sPID, err)
-	} else {
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			return fmt.Errorf("parent process not found: %d: %w", p, err)
-		}
-		if err := p.Signal(syscall.SIGUSR1); err != nil {
-			return fmt.Errorf("failed to notify parent with PID=%d: %w", pid, err)
+	if err := reportStartup(vars, nil); err != nil {
+		runtime.Close()
+		signal.Stop(sig)
+		return err
+	}
+	// Unset the environment variables once the program is running.
+	for _, envVar := range []string{vars.stage(), vars.addr(), vars.secret()} {
+		if err := os.Unsetenv(envVar); err != nil {
+			lg.Printf("failed to unset environment variable %s: %s", envVar, err)
 		}
 	}
 	return nil
-}
-
-// isRunning checks if the process with the given PID is running.
-func isRunning(pidFile string) (bool, error) {
-	pid, err := readPID(pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false, nil
-	}
-	if err := p.Signal(syscall.SIGUSR2); err != nil {
-		return false, nil
-	}
-	return true, nil
-}
-
-// terminate sends a SIGTERM signal to the process with the given PID.
-func terminate(pidFile string) error {
-	pid, err := readPID(pidFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrNotRunning
-		}
-		return err
-	} else if pid == 0 {
-		return ErrNoPID
-	}
-
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Signal(syscall.SIGTERM)
 }

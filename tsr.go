@@ -23,6 +23,8 @@ const (
 var (
 	ErrNoPID      = errors.New("PID unknown")
 	ErrNotRunning = errors.New("not running")
+	// ErrAlreadyRunning means another daemon instance owns the state lock.
+	ErrAlreadyRunning = errors.New("already running")
 )
 
 type Process struct {
@@ -101,18 +103,40 @@ func (p *Process) Terminate() error {
 	return terminate(p.pidFile)
 }
 
-// Close removes the PID file.
+// Close removes this process's authenticated state file. It does not remove
+// state owned by another process, even if the same Process value is reused.
 func (p *Process) Close() error {
-	_ = os.Remove(p.pidFile)
+	if runtime := currentControlRuntime(p.pidFile); runtime != nil {
+		runtime.Close()
+		return nil
+	}
+	lock, err := acquireStateLock(p.pidFile)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	state, err := readControlState(p.pidFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if state.PID != os.Getpid() {
+		return fmt.Errorf("state file belongs to process %d", state.PID)
+	}
+	lock.removeOwnedState(p.pidFile, state.secretID)
 	return nil
 }
 
 // readPID reads the PID from the PID file.
 // PID File format:
-//   PID
-//   data1
-//   ...
-//   dataN
+//
+//	PID
+//	data1
+//	...
+//	dataN
 func readPID(filename string, data ...*string) (int, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -131,23 +155,6 @@ func readPID(filename string, data ...*string) (int, error) {
 		}
 	}
 	return pid, nil
-}
-
-func writePID(filename string, PID int, data ...string) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := fmt.Fprintf(f, "%d\n", PID); err != nil {
-		return err
-	}
-	for _, s := range data {
-		if _, err := fmt.Fprintln(f, s); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func hash(s string) string {
