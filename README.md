@@ -12,4 +12,31 @@ NetBSD).  Windows support is experimental.
 
 For usage example, see [cmd/responder](cmd/responder/main.go)
 
+## How it works (POSIX)
+
+The background process holds an `fcntl(2)` write lock on the PID file for its
+whole lifetime.  The kernel releases the lock when the process exits, even if
+it is killed with `SIGKILL`.  `IsRunning`, `PID` and `Terminate` ask the
+kernel who holds the lock instead of trusting the PID written in the file, so:
+
+- checking the status never sends a signal;
+- a stale PID file never causes an unrelated process to be signalled;
+- a second `TSR()` returns `ErrAlreadyRunning` and leaves the running process
+  alone;
+- `Terminate` sends `SIGTERM` to the lock holder and returns once it has
+  exited.
+
+Limitations:
+
+- The PID file must be on a local filesystem, and all processes must share a
+  PID namespace.
+- Use an absolute PID file path (`WithPIDFile`) if the program can be started
+  from different working directories.  The default is relative to the working
+  directory.
+- On Linux, `Terminate` signals the process through a pidfd, which rules out
+  PID reuse.  On other systems a very small window remains between the lock
+  check and the signal.
+- Windows uses a different, experimental mechanism and does not lock the PID
+  file.
+
 [1]: https://en.wikipedia.org/wiki/Terminate-and-stay-resident_program

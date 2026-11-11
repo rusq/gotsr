@@ -21,8 +21,9 @@ const (
 // try on windows: https://superuser.com/questions/198525/how-can-i-execute-a-windows-command-line-in-background
 
 var (
-	ErrNoPID      = errors.New("PID unknown")
-	ErrNotRunning = errors.New("not running")
+	ErrNoPID          = errors.New("PID unknown")
+	ErrNotRunning     = errors.New("not running")
+	ErrAlreadyRunning = errors.New("already running")
 )
 
 type Process struct {
@@ -50,6 +51,11 @@ func WithDebug(b bool) Option {
 // New returns new Process.  If caller does not set the PID file path and name
 // explicitely with WithPIDFile option, it is inferred from the executable file
 // name.  So that the PID file for "foo.exe" will be "foo.pid".
+//
+// On POSIX systems, the running TSR process holds a lock on the PID file for
+// its whole lifetime, and IsRunning, PID and Terminate rely on that lock rather
+// than on the PID written in the file.  The PID file must reside on a local
+// filesystem.
 func New(opts ...Option) (*Process, error) {
 	var p = Process{
 		startTimeout: startTimeout,
@@ -80,9 +86,10 @@ func (p *Process) TSR() (headless bool, err error) {
 	return tsr(p.pidFile, p.startTimeout, p.atExit...)
 }
 
-// PID returns the PID of the TSR process if it's running.
+// PID returns the PID of the TSR process if it's running.  On POSIX systems
+// it returns ErrNotRunning if no process holds the lock on the PID file.
 func (p *Process) PID() (int, error) {
-	return readPID(p.pidFile)
+	return statePID(p.pidFile)
 }
 
 // AtExit appends the function to the list of functions that will be executed
@@ -101,18 +108,20 @@ func (p *Process) Terminate() error {
 	return terminate(p.pidFile)
 }
 
-// Close removes the PID file.
+// Close removes the PID file.  Called in the TSR process, it also releases
+// the lock.  Called in any other process, it removes the PID file only if it
+// is stale, i.e. no running TSR process holds it.
 func (p *Process) Close() error {
-	_ = os.Remove(p.pidFile)
-	return nil
+	return closeState(p.pidFile)
 }
 
 // readPID reads the PID from the PID file.
 // PID File format:
-//   PID
-//   data1
-//   ...
-//   dataN
+//
+//	PID
+//	data1
+//	...
+//	dataN
 func readPID(filename string, data ...*string) (int, error) {
 	f, err := os.Open(filename)
 	if err != nil {

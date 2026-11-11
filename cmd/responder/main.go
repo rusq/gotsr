@@ -40,10 +40,6 @@ func main() {
 		}
 		return // exit
 	}
-	// We need to make sure that we're not trying to startup the second time.
-	if isRunning, err := p.IsRunning(); err == nil && isRunning {
-		log.Fatal("already running")
-	}
 
 	// Register a function to be called when the program is terminating.  It is
 	// important to add all AtExit functions before calling TSR().
@@ -52,9 +48,11 @@ func main() {
 	})
 
 	// Start the process.  If the process is already running, this will return
-	// an error.
+	// ErrAlreadyRunning, and the running process is left alone.
 	headless, err := p.TSR()
-	if err != nil {
+	if errors.Is(err, gotsr.ErrAlreadyRunning) {
+		log.Fatal("already running")
+	} else if err != nil {
 		log.Fatal(err)
 	}
 
@@ -102,17 +100,19 @@ func stopProcess(p *gotsr.Process) error {
 
 func printStatus(p *gotsr.Process) error {
 	// Check if the process is running.
-	if running, err := p.IsRunning(); err != nil {
-		if errors.Is(err, gotsr.ErrNotRunning) {
-			log.Printf("process is not running")
-			return nil
-		}
+	running, err := p.IsRunning()
+	if err != nil {
 		return err
-	} else if running {
-		log.Println("process is running")
-	} else {
-		log.Println("process is not running")
 	}
+	if !running {
+		log.Println("process is not running")
+		return nil
+	}
+	pid, err := p.PID()
+	if err != nil {
+		return err
+	}
+	log.Printf("process is running with PID %d", pid)
 	return nil
 }
 

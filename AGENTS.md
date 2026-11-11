@@ -14,7 +14,10 @@ Primary code lives in the root package `gotsr`. A usage example lives in
 - `tsr.go`: public API, options, PID file helpers, shared logic.
 - `tsr_posix.go`: POSIX implementation behind build tags.
 - `tsr_windows.go`: experimental Windows implementation.
+- `lock_posix.go`: PID file locking (daemon identity) on POSIX.
 - `tsr_test.go`: unit tests for helper functions in the root package.
+- `lock_posix_test.go`, `lifecycle_posix_test.go`, `helper_posix_test.go`:
+  POSIX lock and subprocess lifecycle tests.
 - `tsr_windows_test.go`: placeholder Windows test coverage.
 - `stage.go` and `stage_string.go`: stage enum and generated string helpers.
 - `logger.go`: package logger abstraction.
@@ -37,19 +40,18 @@ and update this document accordingly.
 ## Environment Notes
 
 - Module path: `github.com/rusq/gotsr`
-- Declared Go version: `1.19` in `go.mod`
+- Declared Go version: `1.27` in `go.mod`
 - CI currently runs on Ubuntu with `go build -v ./...` and `go test -v ./...`
 - The default implementation target is POSIX; Windows support is experimental
   per `README.md`
 
 ## Important Current State
 
-Before making changes, know that the repository currently has a build failure.
-
-- `go test ./...` fails in `tsr_posix.go` because of an invalid `fmt.Errorf`
-  format string around the parent-process-not-found error path.
-- Do not assume a red test run is caused by your change until you confirm
-  whether that existing issue is still present.
+- On POSIX, process identity is an `fcntl` lock on the PID file held by the
+  daemon for its lifetime (`lock_posix.go`).  Inside the daemon, never open and
+  close the PID file directly: closing any descriptor drops the lock.  Use the
+  `held` state instead.
+- Lifecycle tests re-execute the test binary as a helper (`helper_posix_test.go`).
 
 ## Build Commands
 
@@ -213,7 +215,6 @@ idiomatic Go, with a preference for stdlib-only solutions and simple APIs.
 - Preserve public API compatibility unless the task explicitly requires a break.
 - If you touch build-tagged files, verify the change does not silently diverge
   between platforms.
-- Mention the existing broken test/build state when reporting validation.
 
 ## When Unsure
 
