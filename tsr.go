@@ -50,11 +50,13 @@ func WithDebug(b bool) Option {
 
 // New returns new Process.  If caller does not set the PID file path and name
 // explicitely with WithPIDFile option, it is inferred from the executable file
-// name.  So that the PID file for "foo.exe" will be "foo.pid".
+// name.  So that the PID file for "foo.exe" will be "foo.pid".  A relative
+// path is resolved against the current working directory when New is called.
 //
-// On POSIX systems, the running TSR process holds a lock on the PID file for
-// its whole lifetime, and IsRunning, PID and Terminate rely on that lock rather
-// than on the PID written in the file.  The PID file must reside on a local
+// On POSIX systems, the running TSR process holds a lock on "<pidfile>.lock"
+// for its whole lifetime, and IsRunning, PID and Terminate rely on that lock
+// rather than on the PID written in the PID file, which is informational only.
+// The lock file is never removed.  Both files must reside on a local
 // filesystem.
 func New(opts ...Option) (*Process, error) {
 	var p = Process{
@@ -70,6 +72,13 @@ func New(opts ...Option) (*Process, error) {
 		}
 		p.pidFile = pidFromExe(exe)
 	}
+	// Resolve the path now, so that a later change of the working directory
+	// can not redirect the PID file.
+	abs, err := filepath.Abs(p.pidFile)
+	if err != nil {
+		return nil, err
+	}
+	p.pidFile = abs
 
 	return &p, nil
 }

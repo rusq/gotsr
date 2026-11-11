@@ -39,7 +39,9 @@ func TestLifecycle(t *testing.T) {
 		t.Fatal("daemon died after IsRunning")
 	}
 
-	// A second instance must not start, and must not disturb the first.
+	// A second instance must not start, and must not disturb the first.  The
+	// daemon has read its own PID file by now, which must not have dropped
+	// the lock.
 	if code := startDaemon(t, path); code != exitAlreadyRunning {
 		t.Errorf("second start: exit code %d, want %d", code, exitAlreadyRunning)
 	}
@@ -64,6 +66,9 @@ func TestLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("PID file was not removed: %v", err)
+	}
+	if _, err := os.Stat(lockPathFor(path)); err != nil {
+		t.Errorf("lock file must persist: %v", err)
 	}
 	if err := p.Terminate(); !errors.Is(err, ErrNotRunning) {
 		t.Errorf("second Terminate() error = %v, want %v", err, ErrNotRunning)

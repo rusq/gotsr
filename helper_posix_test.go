@@ -23,6 +23,8 @@ const (
 
 	modeDaemon = "daemon" // run TSR and stay resident
 	modeLock   = "lock"   // hold the lock in the foreground
+
+	readySuffix = ".ready" // created by the daemon helper once it is running
 )
 
 // exit codes of the helper process.
@@ -55,6 +57,15 @@ func runHelper(mode, path string) int {
 			return exitError
 		}
 		if headless {
+			// Daemon code may read its own PID file.  This must not drop
+			// the lifetime lock.  The ready marker tells the test that the
+			// read has happened.
+			if _, err := os.ReadFile(path); err != nil {
+				return exitError
+			}
+			if err := os.WriteFile(path+readySuffix, nil, 0o600); err != nil {
+				return exitError
+			}
 			// Go ignores SIGUSR1/2 by default, but programs commonly use them
 			// (e.g. log rotation).  The library must never send them, so
 			// the helper dies if it receives one.
@@ -65,7 +76,7 @@ func runHelper(mode, path string) int {
 		}
 		return exitOK
 	case modeLock:
-		if _, err := acquireLock(path); err != nil {
+		if _, err := acquire(path); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return exitError
 		}
@@ -107,7 +118,23 @@ func startDaemon(t *testing.T, path string) int {
 	} else if err != nil {
 		t.Fatal(err)
 	}
+	waitFile(t, path+readySuffix)
 	return exitOK
+}
+
+// waitFile waits for the file to appear, and removes it.
+func waitFile(t *testing.T, name string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := os.Remove(name); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", name)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // holdLock starts a foreground helper process that holds the lock on path.

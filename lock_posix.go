@@ -8,92 +8,120 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 )
 
-// The running daemon holds an fcntl(2) write lock on the PID file for its
-// whole lifetime.  The kernel releases the lock when the process dies, even
-// on SIGKILL, so the lock, not the file contents, is the source of truth:
+// The running daemon holds an fcntl(2) write lock on the lock file
+// "<pidfile>.lock" for its whole lifetime.  The kernel releases the lock when
+// the process dies, even on SIGKILL, so the lock is the source of truth:
 //
-//   - the PID file is "live" only while the lock is held;
+//   - the daemon is running only while the lock is held;
 //   - F_GETLK reports the PID of the lock holder, which binds the PID to the
-//     daemon instance and makes stale PID files harmless.
+//     daemon instance and makes stale files harmless.
 //
-// The PID file must be on a local filesystem; lock holder PIDs are not
+// The PID file is informational only, and anyone may read it, including the
+// daemon itself.  The lock is kept on a separate file because closing ANY
+// descriptor of a locked file in the owning process drops an fcntl lock: a
+// plain os.ReadFile of the PID file in the daemon would otherwise silently
+// release it.
+//
+// The lock file is never removed.  It is a persistent sentinel, which avoids
+// the races of unlinking a locked file.
+//
+// Both files must be on a local filesystem; lock holder PIDs are not
 // meaningful over network filesystems or across PID namespaces.
 //
-// Two POSIX quirks shape this code:
-//
-//   - a process does not see its own fcntl locks via F_GETLK;
-//   - closing ANY descriptor of the locked file in the owning process drops
-//     the lock.
-//
-// Therefore, inside the daemon the lock state is answered from [held], and
-// the PID file is never opened again.
+// A process does not see its own fcntl locks via F_GETLK, so inside the
+// daemon the lock state is answered from [held], and the lock file is never
+// opened again.
 
-// held is the lock owned by this process, if it is the daemon.
+// claim is the lifetime identity of the running daemon.
+type claim struct {
+	pidPath string      // absolute path of the PID file
+	lock    *os.File    // locked lock file, must stay open
+	pidInfo os.FileInfo // PID file written by this daemon
+}
+
+// held is the claim owned by this process, if it is the daemon.
 var held struct {
-	mu   sync.Mutex
-	path string
-	f    *os.File
+	mu sync.Mutex
+	c  *claim
 }
 
-// setHeld records the lock owned by this process.
-func setHeld(path string, f *os.File) {
-	held.mu.Lock()
-	defer held.mu.Unlock()
-	held.path = path
-	held.f = f
+// lockPathFor returns the lock file path for the PID file.
+func lockPathFor(pidFile string) string {
+	return pidFile + ".lock"
 }
 
-// heldPID returns the PID of this process if it holds the lock on path.
-func heldPID(path string) (int, bool) {
+// setHeld records the claim owned by this process.
+func setHeld(c *claim) {
 	held.mu.Lock()
 	defer held.mu.Unlock()
-	if !isHeld(path) {
+	held.c = c
+}
+
+// heldPID returns the PID of this process if it holds the lock for pidFile.
+func heldPID(pidFile string) (int, bool) {
+	held.mu.Lock()
+	defer held.mu.Unlock()
+	if !isHeld(pidFile) {
 		return 0, false
 	}
 	return os.Getpid(), true
 }
 
-// releaseHeld removes the PID file and releases the lock, if this process
-// holds the lock on path.  It reports whether the lock was held.
-func releaseHeld(path string) bool {
-	held.mu.Lock()
-	defer held.mu.Unlock()
-	if !isHeld(path) {
-		return false
-	}
-	// remove before closing, so that the name never points to an unlocked
-	// file that we own.
-	_ = os.Remove(held.path)
-	_ = held.f.Close()
-	held.path = ""
-	held.f = nil
-	return true
-}
-
 // isHeld must be called with held.mu locked.
-func isHeld(path string) bool {
-	if held.f == nil {
+func isHeld(pidFile string) bool {
+	if held.c == nil {
 		return false
 	}
-	if held.path == path {
+	if held.c.pidPath == pidFile {
 		return true
 	}
 	// different spelling of the same path?  Stat does not open the file, so
 	// it does not drop the lock.
-	fi, err := os.Stat(path)
+	fi, err := os.Stat(lockPathFor(pidFile))
 	if err != nil {
 		return false
 	}
-	hi, err := held.f.Stat()
+	hi, err := held.c.lock.Stat()
 	if err != nil {
 		return false
 	}
 	return os.SameFile(fi, hi)
+}
+
+// releaseHeld removes the PID file, if it is still the one written by this
+// process, and releases the lock.  It reports whether this process held a
+// lock.
+func releaseHeld() bool {
+	held.mu.Lock()
+	defer held.mu.Unlock()
+	if held.c == nil {
+		return false
+	}
+	// The PID file may have been replaced, for example by a daemon started
+	// after this one lost its PID file.  Remove only our own file.
+	if fi, err := os.Lstat(held.c.pidPath); err == nil && os.SameFile(fi, held.c.pidInfo) {
+		_ = os.Remove(held.c.pidPath)
+	}
+	_ = held.c.lock.Close()
+	held.c = nil
+	return true
+}
+
+// releaseHeldFor releases the lock if this process holds it for pidFile.
+func releaseHeldFor(pidFile string) bool {
+	held.mu.Lock()
+	ok := isHeld(pidFile)
+	held.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return releaseHeld()
 }
 
 // newFlock returns a whole-file write lock request.
@@ -101,70 +129,84 @@ func newFlock() syscall.Flock_t {
 	return syscall.Flock_t{Type: syscall.F_WRLCK, Whence: io.SeekStart}
 }
 
-// acquireLock opens or creates the PID file, locks it and writes the current
-// PID into it.  It returns ErrAlreadyRunning if another process holds the
-// lock.  The returned file must stay open for as long as the lock is needed.
-func acquireLock(path string) (*os.File, error) {
-	const attempts = 3
-	for range attempts {
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		lk := newFlock()
-		if err := syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lk); err != nil {
-			f.Close()
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EACCES) {
-				return nil, ErrAlreadyRunning
-			}
-			return nil, fmt.Errorf("failed to lock %s: %w", path, err)
-		}
-		// The previous owner may have unlinked the file between our open and
-		// lock.  Make sure that we have locked the file that the path names.
-		if !sameFile(f, path) {
-			f.Close()
-			continue
-		}
-		if err := writeLocked(f, os.Getpid()); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("failed to write %s: %w", path, err)
-		}
-		return f, nil
-	}
-	return nil, fmt.Errorf("failed to lock %s: file keeps changing", path)
+// isLocked reports whether err means that another process holds the lock.
+func isLocked(err error) bool {
+	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EACCES)
 }
 
-// sameFile reports whether f is the file that path names.
-func sameFile(f *os.File, path string) bool {
-	fi, err := f.Stat()
+// acquire takes the lifetime lock for the PID file and publishes the PID
+// file.  It returns ErrAlreadyRunning if another process holds the lock.
+// pidFile must be absolute.
+func acquire(pidFile string) (*claim, error) {
+	f, err := acquireLock(lockPathFor(pidFile))
 	if err != nil {
-		return false
+		return nil, err
 	}
-	li, err := os.Lstat(path)
+	fi, err := publishPID(pidFile, os.Getpid())
 	if err != nil {
-		return false
+		f.Close()
+		return nil, fmt.Errorf("failed to write %s: %w", pidFile, err)
 	}
-	return os.SameFile(fi, li)
+	return &claim{pidPath: pidFile, lock: f, pidInfo: fi}, nil
 }
 
-// writeLocked replaces the contents of f with the PID.
-func writeLocked(f *os.File, pid int) error {
-	if err := f.Truncate(0); err != nil {
-		return err
+// acquireLock opens or creates the lock file and locks it.  It returns
+// ErrAlreadyRunning if another process holds the lock.
+func acquireLock(lockFile string) (*os.File, error) {
+	f, err := os.OpenFile(lockFile, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := f.WriteAt(fmt.Appendf(nil, "%d\n", pid), 0); err != nil {
-		return err
+	lk := newFlock()
+	if err := syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lk); err != nil {
+		f.Close()
+		if isLocked(err) {
+			return nil, ErrAlreadyRunning
+		}
+		return nil, fmt.Errorf("failed to lock %s: %w", lockFile, err)
 	}
-	return f.Sync()
+	return f, nil
 }
 
-// lockHolder returns the PID of the process holding the lock on the PID file,
-// or 0 if the file does not exist or nobody holds the lock.
-func lockHolder(path string) (int, error) {
-	if pid, ok := heldPID(path); ok {
+// publishPID atomically replaces the PID file with one containing pid, and
+// returns its file info.  Rename replaces a symlink at the path, it does not
+// follow it.
+func publishPID(pidFile string, pid int) (os.FileInfo, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(pidFile), filepath.Base(pidFile)+".tmp*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := fmt.Fprintf(tmp, "%d\n", pid); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	fi, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp.Name(), pidFile); err != nil {
+		return nil, err
+	}
+	return fi, nil
+}
+
+// lockHolder returns the PID of the process holding the lock for the PID
+// file, or 0 if nobody holds it.
+func lockHolder(pidFile string) (int, error) {
+	if pid, ok := heldPID(pidFile); ok {
 		return pid, nil
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	lockFile := lockPathFor(pidFile)
+	f, err := os.OpenFile(lockFile, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, nil
@@ -174,7 +216,7 @@ func lockHolder(path string) (int, error) {
 	defer f.Close()
 	lk := newFlock()
 	if err := syscall.FcntlFlock(f.Fd(), syscall.F_GETLK, &lk); err != nil {
-		return 0, fmt.Errorf("failed to query lock on %s: %w", path, err)
+		return 0, fmt.Errorf("failed to query lock on %s: %w", lockFile, err)
 	}
 	if lk.Type == syscall.F_UNLCK {
 		return 0, nil
@@ -182,29 +224,18 @@ func lockHolder(path string) (int, error) {
 	return int(lk.Pid), nil
 }
 
-// removeStale removes the PID file if no process holds the lock on it.  It
-// takes the lock itself while removing, so that it never removes the file of
-// a daemon that is starting up.
-func removeStale(path string) error {
-	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+// removeStale removes the PID file if no process holds the lock.  It takes
+// the lock itself while removing, so that it never removes the file of a
+// daemon that is starting up.
+func removeStale(pidFile string) error {
+	f, err := acquireLock(lockPathFor(pidFile))
+	if errors.Is(err, ErrAlreadyRunning) {
+		return nil // live daemon, leave it alone
+	} else if err != nil {
 		return err
 	}
 	defer f.Close()
-	lk := newFlock()
-	if err := syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lk); err != nil {
-		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EACCES) {
-			return nil // live daemon, leave it alone
-		}
-		return fmt.Errorf("failed to lock %s: %w", path, err)
-	}
-	if !sameFile(f, path) {
-		return nil // replaced in the meantime
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := os.Remove(pidFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil

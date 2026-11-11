@@ -47,10 +47,11 @@ and update this document accordingly.
 
 ## Important Current State
 
-- On POSIX, process identity is an `fcntl` lock on the PID file held by the
-  daemon for its lifetime (`lock_posix.go`).  Inside the daemon, never open and
-  close the PID file directly: closing any descriptor drops the lock.  Use the
-  `held` state instead.
+- On POSIX, process identity is an `fcntl` lock on `<pidfile>.lock`, held by
+  the daemon for its lifetime (`lock_posix.go`).  The PID file is
+  informational.  Inside the daemon, never open the lock file again: closing
+  any descriptor of it drops the lock.  Use the `held` state instead.  The lock
+  file is never unlinked.
 - Lifecycle tests re-execute the test binary as a helper (`helper_posix_test.go`).
 
 ## Build Commands

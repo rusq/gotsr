@@ -157,12 +157,12 @@ func stageRun(pidFile string, vars envVar, atExit []func()) error {
 		status.Close()
 	}
 
-	f, err := acquireLock(pidFile)
+	c, err := acquire(pidFile)
 	if err != nil {
 		report("ERR " + err.Error())
 		return err
 	}
-	setHeld(pidFile, f)
+	setHeld(c)
 
 	// Register before reporting success, the channel buffers a signal that
 	// arrives early.
@@ -178,7 +178,7 @@ func stageRun(pidFile string, vars envVar, atExit []func()) error {
 		for _, fn := range atExit {
 			fn()
 		}
-		releaseHeld(pidFile)
+		releaseHeld()
 		os.Exit(0)
 	}()
 	return nil
@@ -217,10 +217,11 @@ func statePID(pidFile string) (int, error) {
 	return pid, nil
 }
 
-// closeState removes the PID file.  The daemon releases its lock.  Any other
-// process removes the file only if no process holds the lock on it.
+// closeState removes the PID file.  The daemon releases its lock and removes
+// the PID file if it is still its own.  Any other process removes the PID file
+// only if no process holds the lock.
 func closeState(pidFile string) error {
-	if releaseHeld(pidFile) {
+	if releaseHeldFor(pidFile) {
 		return nil
 	}
 	return removeStale(pidFile)
