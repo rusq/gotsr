@@ -14,8 +14,3 @@ func newEnvVar(s string) envVar {
 func (id envVar) stage() string {
 	return "TSR_" + string(id) + "__STG"
 }
-
-// pid returns the name of the environment variable that holds the PID.
-func (id envVar) pid() string {
-	return "TSR_" + string(id) + "__PID"
-}

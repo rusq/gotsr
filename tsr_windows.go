@@ -15,6 +15,11 @@ var (
 	errInvalidStage = errors.New("invalid stage")
 )
 
+// pid returns the name of the environment variable that holds the PID.
+func (id envVar) pid() string {
+	return "TSR_" + string(id) + "__PID"
+}
+
 // addr returns an additional environment variable used only on Windows.
 // It is used to pass the addr number to the detached process.
 func (id envVar) addr() string {
@@ -180,6 +185,17 @@ func notifySuccess(vars envVar) error {
 	if _, err := conn.Write([]byte("ok")); err != nil {
 		return err
 	}
+	return nil
+}
+
+// statePID returns the PID stored in the PID file.
+func statePID(pidFile string) (int, error) {
+	return readPID(pidFile)
+}
+
+// closeState removes the PID file.
+func closeState(pidFile string) error {
+	_ = os.Remove(pidFile)
 	return nil
 }
 
